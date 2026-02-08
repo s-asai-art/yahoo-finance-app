@@ -1,12 +1,19 @@
 """Yahoo!ファイナンスから株価情報を取得するモジュール"""
 
+import os
 import re
+import ssl
 from dataclasses import dataclass, field
 
 import requests
 import urllib3
 from bs4 import BeautifulSoup
 
+# SSL証明書検証をグローバルに無効化（yfinance内部のHTTPクライアント含む）
+os.environ["PYTHONHTTPSVERIFY"] = "0"
+os.environ["CURL_CA_BUNDLE"] = ""
+os.environ["REQUESTS_CA_BUNDLE"] = ""
+ssl._create_default_https_context = ssl._create_unverified_context
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 try:
@@ -80,9 +87,12 @@ class StockScraper:
         Returns:
             StockPrice: 株価情報
         """
-        # yfinanceが利用可能ならAPIベースで取得（より安定）
+        # yfinanceが利用可能ならAPIベースで取得し、失敗時はスクレイピングへ
         if HAS_YFINANCE:
-            return self._fetch_via_yfinance(code)
+            try:
+                return self._fetch_via_yfinance(code)
+            except Exception:
+                pass
         return self._fetch_via_scraping(code)
 
     def _normalize_code(self, code: str) -> str:
