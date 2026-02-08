@@ -1,13 +1,16 @@
 """Yahoo!ファイナンスから株価情報を取得するモジュール"""
 
 import re
+import ssl
+import urllib.request
 from dataclasses import dataclass, field
 
-import requests
-import urllib3
 from bs4 import BeautifulSoup
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# SSL証明書検証を無効化したコンテキスト
+SSL_CONTEXT = ssl.create_default_context()
+SSL_CONTEXT.check_hostname = False
+SSL_CONTEXT.verify_mode = ssl.CERT_NONE
 
 BASE_URL = "https://finance.yahoo.co.jp"
 HEADERS = {
@@ -18,6 +21,13 @@ HEADERS = {
     ),
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
 }
+
+
+def _fetch_html(url: str) -> str:
+    """URLからHTMLを取得する（標準ライブラリのみ使用）"""
+    req = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=15, context=SSL_CONTEXT) as resp:
+        return resp.read().decode("utf-8", errors="replace")
 
 
 @dataclass
@@ -59,11 +69,6 @@ class StockPrice:
 class StockScraper:
     """Yahoo!ファイナンスから株価情報をスクレイピングするクラス"""
 
-    def __init__(self, session: requests.Session | None = None):
-        self.session = session or requests.Session()
-        self.session.headers.update(HEADERS)
-        self.session.verify = False
-
     def fetch(self, code: str) -> StockPrice:
         """株価情報を取得する
 
@@ -73,15 +78,10 @@ class StockScraper:
         Returns:
             StockPrice: 株価情報
         """
-        return self._fetch_via_scraping(code)
-
-    def _fetch_via_scraping(self, code: str) -> StockPrice:
-        """Webスクレイピングで株価を取得"""
         clean_code = code.replace(".T", "").strip()
         url = f"{BASE_URL}/quote/{clean_code}.T"
-        resp = self.session.get(url, timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "lxml")
+        html = _fetch_html(url)
+        soup = BeautifulSoup(html, "lxml")
 
         stock = StockPrice(code=clean_code)
 

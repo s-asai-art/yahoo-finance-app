@@ -1,14 +1,17 @@
 """Yahoo!ファイナンス掲示板から投稿情報を取得するモジュール"""
 
 import re
+import ssl
+import urllib.request
 from dataclasses import dataclass
 from urllib.parse import urljoin
 
-import requests
-import urllib3
 from bs4 import BeautifulSoup
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# SSL証明書検証を無効化したコンテキスト
+SSL_CONTEXT = ssl.create_default_context()
+SSL_CONTEXT.check_hostname = False
+SSL_CONTEXT.verify_mode = ssl.CERT_NONE
 
 BASE_URL = "https://finance.yahoo.co.jp"
 BOARD_URL = f"{BASE_URL}/cm/message"
@@ -20,6 +23,13 @@ HEADERS = {
     ),
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
 }
+
+
+def _fetch_html(url: str) -> str:
+    """URLからHTMLを取得する（標準ライブラリのみ使用）"""
+    req = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=15, context=SSL_CONTEXT) as resp:
+        return resp.read().decode("utf-8", errors="replace")
 
 
 @dataclass
@@ -51,19 +61,8 @@ class BoardPost:
 class BoardScraper:
     """Yahoo!ファイナンス掲示板をスクレイピングするクラス"""
 
-    def __init__(self, session: requests.Session | None = None):
-        self.session = session or requests.Session()
-        self.session.headers.update(HEADERS)
-        self.session.verify = False
-
     def _build_board_url(self, code: str) -> str:
-        """掲示板のURLを構築する
-
-        Yahoo!ファイナンス掲示板のURLは以下の形式:
-        https://finance.yahoo.co.jp/cm/message/1{code}/{encoded_name}
-        銘柄コードからトップレベルの掲示板一覧ページへアクセスし、
-        実際の掲示板URLを取得する。
-        """
+        """掲示板のURLを構築する"""
         clean_code = code.replace(".T", "").strip()
         return f"{BASE_URL}/cm/message/1{clean_code}"
 
@@ -74,23 +73,22 @@ class BoardScraper:
         # まず直接的なURLパターンを試す
         direct_url = self._build_board_url(code)
         try:
-            resp = self.session.get(direct_url, timeout=15, allow_redirects=True)
-            if resp.status_code == 200:
-                return resp.url
-        except requests.RequestException:
+            html = _fetch_html(direct_url)
+            if html:
+                return direct_url
+        except Exception:
             pass
 
         # 検索ページから掲示板リンクを取得
         search_url = f"{BASE_URL}/search/?query={clean_code}"
         try:
-            resp = self.session.get(search_url, timeout=15)
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "lxml")
+            html = _fetch_html(search_url)
+            soup = BeautifulSoup(html, "lxml")
             for link in soup.find_all("a", href=True):
                 href = link["href"]
                 if "/cm/message/" in href and clean_code in href:
                     return urljoin(BASE_URL, href)
-        except requests.RequestException:
+        except Exception:
             pass
 
         return direct_url
@@ -109,9 +107,8 @@ class BoardScraper:
         if page > 1:
             board_url = f"{board_url}?p={page}"
 
-        resp = self.session.get(board_url, timeout=15)
-        resp.raise_for_status()
-        return self._parse_board_page(resp.text, board_url)
+        html = _fetch_html(board_url)
+        return self._parse_board_page(html, board_url)
 
     def _parse_board_page(self, html: str, base_url: str) -> list[BoardPost]:
         """掲示板ページのHTMLをパースして投稿リストを返す"""
@@ -200,9 +197,8 @@ class BoardScraper:
 
     def fetch_post_detail(self, url: str) -> BoardPost:
         """個別投稿の詳細ページを取得する"""
-        resp = self.session.get(url, timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "lxml")
+        html = _fetch_html(url)
+        soup = BeautifulSoup(html, "lxml")
 
         post = BoardPost(url=url)
 
