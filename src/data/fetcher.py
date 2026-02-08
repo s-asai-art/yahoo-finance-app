@@ -1,5 +1,6 @@
 """Yahoo!ファイナンスからデータを取得するモジュール"""
 
+import os
 import re
 import time
 
@@ -10,6 +11,16 @@ from src.utils.cache import cached
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# --- SSL証明書の設定（Windows curl_cffi対策） ---
+try:
+    import certifi
+    ca_bundle = certifi.where()
+    os.environ.setdefault("CURL_CA_BUNDLE", ca_bundle)
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", ca_bundle)
+    os.environ.setdefault("SSL_CERT_FILE", ca_bundle)
+except ImportError:
+    pass
 
 
 def _to_ticker(code: str) -> str:
@@ -23,24 +34,10 @@ def _parse_price_str(s: str) -> float | None:
     if not s:
         return None
     try:
-        return float(s.replace(",", "").replace("円", "").strip())
+        cleaned = re.sub(r'[^\d.\-+]', '', s.replace(",", ""))
+        return float(cleaned) if cleaned else None
     except (ValueError, TypeError):
         return None
-
-
-def _fetch_with_yfinance(code: str, method: str = "info"):
-    """yfinanceでデータ取得を試みる（複数の方法でリトライ）"""
-    import yfinance as yf
-    ticker_str = _to_ticker(code)
-    ticker = yf.Ticker(ticker_str)
-
-    if method == "info":
-        return ticker.info
-    elif method == "fast_info":
-        return ticker.fast_info
-    elif method == "history":
-        return ticker.history
-    return None
 
 
 def _fetch_realtime_via_scraper(code: str) -> dict | None:
@@ -51,13 +48,15 @@ def _fetch_realtime_via_scraper(code: str) -> dict | None:
         stock = scraper.fetch(code)
 
         price = _parse_price_str(stock.price)
+        if not price:
+            return None
+
         prev_close = _parse_price_str(stock.previous_close)
 
         change = None
         change_pct = None
         change_str = stock.change.strip() if stock.change else ""
         if change_str:
-            # "前日比 +100 (+1.5%)" のようなフォーマットを解析
             parts = re.split(r'[（(]', change_str)
             change = _parse_price_str(parts[0])
             if len(parts) > 1:
@@ -88,115 +87,142 @@ def _fetch_realtime_via_scraper(code: str) -> dict | None:
             "trading_value": None,
         }
     except Exception as e:
-        logger.error(f"スクレイパーによる株価取得エラー ({code}): {e}")
+        logger.warning(f"スクレイパーによる株価取得エラー ({code}): {e}")
         return None
 
 
-@cached(ttl=30)
+# 失敗キャッシュ: 同じコードで連続失敗を防ぐ
+_failure_cache: dict[str, float] = {}
+_FAILURE_TTL = 120  # 失敗後120秒はリトライしない
+
+
+def _is_recently_failed(key: str) -> bool:
+    if key in _failure_cache:
+        if time.time() - _failure_cache[key] < _FAILURE_TTL:
+            return True
+        del _failure_cache[key]
+    return False
+
+
+def _mark_failed(key: str):
+    _failure_cache[key] = time.time()
+
+
+@cached(ttl=60)
 def fetch_realtime_price(code: str) -> dict | None:
     """リアルタイム株価を取得する（yfinance -> scraper のフォールバック）"""
 
-    # 方法1: yfinance info
-    try:
-        import yfinance as yf
-        ticker = yf.Ticker(_to_ticker(code))
-        info = ticker.info
-        if info and ("regularMarketPrice" in info or "currentPrice" in info):
-            price = info.get("regularMarketPrice") or info.get("currentPrice")
-            prev_close = info.get("regularMarketPreviousClose") or info.get("previousClose")
-            change = None
-            change_pct = None
-            if price and prev_close:
-                change = price - prev_close
-                change_pct = (change / prev_close) * 100
+    # yfinanceの失敗キャッシュチェック
+    yf_failed = _is_recently_failed(f"yf_realtime_{code}")
 
-            return {
-                "price": price,
-                "change": change,
-                "change_percent": change_pct,
-                "open": info.get("regularMarketOpen") or info.get("open"),
-                "high": info.get("regularMarketDayHigh") or info.get("dayHigh"),
-                "low": info.get("regularMarketDayLow") or info.get("dayLow"),
-                "volume": info.get("regularMarketVolume") or info.get("volume"),
-                "previous_close": prev_close,
-                "market_cap": info.get("marketCap"),
-                "name": info.get("longName") or info.get("shortName", code),
-                "currency": info.get("currency", "JPY"),
-                "fifty_two_week_high": info.get("fiftyTwoWeekHigh"),
-                "fifty_two_week_low": info.get("fiftyTwoWeekLow"),
-                "trading_value": None,
-            }
-    except Exception as e:
-        logger.warning(f"yfinance info取得失敗 ({code}): {e}")
+    if not yf_failed:
+        # 方法1: yfinance
+        try:
+            import yfinance as yf
+            ticker = yf.Ticker(_to_ticker(code))
 
-    # 方法2: yfinance fast_info
-    try:
-        import yfinance as yf
-        ticker = yf.Ticker(_to_ticker(code))
-        fi = ticker.fast_info
-        price = getattr(fi, "last_price", None)
-        if price is not None:
-            prev_close = getattr(fi, "previous_close", None)
-            change = (price - prev_close) if price and prev_close else None
-            change_pct = (change / prev_close * 100) if change and prev_close else None
-            return {
-                "price": price,
-                "previous_close": prev_close,
-                "open": getattr(fi, "open", None),
-                "high": getattr(fi, "day_high", None),
-                "low": getattr(fi, "day_low", None),
-                "volume": getattr(fi, "last_volume", None),
-                "market_cap": getattr(fi, "market_cap", None),
-                "change": change,
-                "change_percent": change_pct,
-                "name": code,
-                "currency": getattr(fi, "currency", "JPY"),
-                "fifty_two_week_high": None,
-                "fifty_two_week_low": None,
-                "trading_value": None,
-            }
-    except Exception as e:
-        logger.warning(f"yfinance fast_info取得失敗 ({code}): {e}")
+            # fast_info が最も軽量
+            try:
+                fi = ticker.fast_info
+                price = getattr(fi, "last_price", None)
+                if price is not None:
+                    prev_close = getattr(fi, "previous_close", None)
+                    change = (price - prev_close) if price and prev_close else None
+                    change_pct = (change / prev_close * 100) if change and prev_close else None
+                    return {
+                        "price": price,
+                        "previous_close": prev_close,
+                        "open": getattr(fi, "open", None),
+                        "high": getattr(fi, "day_high", None),
+                        "low": getattr(fi, "day_low", None),
+                        "volume": getattr(fi, "last_volume", None),
+                        "market_cap": getattr(fi, "market_cap", None),
+                        "change": change,
+                        "change_percent": change_pct,
+                        "name": code,
+                        "currency": getattr(fi, "currency", "JPY"),
+                        "fifty_two_week_high": None,
+                        "fifty_two_week_low": None,
+                        "trading_value": None,
+                    }
+            except Exception:
+                pass
 
-    # 方法3: yfinance history から最新値を取得
-    try:
-        import yfinance as yf
-        ticker = yf.Ticker(_to_ticker(code))
-        hist = ticker.history(period="5d")
-        if hist is not None and not hist.empty:
-            last = hist.iloc[-1]
-            prev = hist.iloc[-2] if len(hist) > 1 else None
-            price = float(last["Close"])
-            prev_close = float(prev["Close"]) if prev is not None else None
-            change = (price - prev_close) if prev_close else None
-            change_pct = (change / prev_close * 100) if change and prev_close else None
-            return {
-                "price": price,
-                "change": change,
-                "change_percent": change_pct,
-                "open": float(last["Open"]),
-                "high": float(last["High"]),
-                "low": float(last["Low"]),
-                "volume": float(last["Volume"]),
-                "previous_close": prev_close,
-                "market_cap": None,
-                "name": code,
-                "currency": "JPY",
-                "fifty_two_week_high": None,
-                "fifty_two_week_low": None,
-                "trading_value": None,
-            }
-    except Exception as e:
-        logger.warning(f"yfinance history取得失敗 ({code}): {e}")
+            # info（重いが詳細）
+            try:
+                info = ticker.info
+                if info and ("regularMarketPrice" in info or "currentPrice" in info):
+                    price = info.get("regularMarketPrice") or info.get("currentPrice")
+                    prev_close = info.get("regularMarketPreviousClose") or info.get("previousClose")
+                    change = None
+                    change_pct = None
+                    if price and prev_close:
+                        change = price - prev_close
+                        change_pct = (change / prev_close) * 100
+                    return {
+                        "price": price,
+                        "change": change,
+                        "change_percent": change_pct,
+                        "open": info.get("regularMarketOpen") or info.get("open"),
+                        "high": info.get("regularMarketDayHigh") or info.get("dayHigh"),
+                        "low": info.get("regularMarketDayLow") or info.get("dayLow"),
+                        "volume": info.get("regularMarketVolume") or info.get("volume"),
+                        "previous_close": prev_close,
+                        "market_cap": info.get("marketCap"),
+                        "name": info.get("longName") or info.get("shortName", code),
+                        "currency": info.get("currency", "JPY"),
+                        "fifty_two_week_high": info.get("fiftyTwoWeekHigh"),
+                        "fifty_two_week_low": info.get("fiftyTwoWeekLow"),
+                        "trading_value": None,
+                    }
+            except Exception:
+                pass
 
-    # 方法4: 既存スクレイパーにフォールバック
-    logger.info(f"スクレイパーにフォールバック ({code})")
+            # history から最新値
+            try:
+                hist = ticker.history(period="5d")
+                if hist is not None and not hist.empty:
+                    last = hist.iloc[-1]
+                    prev = hist.iloc[-2] if len(hist) > 1 else None
+                    price = float(last["Close"])
+                    prev_close = float(prev["Close"]) if prev is not None else None
+                    change = (price - prev_close) if prev_close else None
+                    change_pct = (change / prev_close * 100) if change and prev_close else None
+                    return {
+                        "price": price,
+                        "change": change,
+                        "change_percent": change_pct,
+                        "open": float(last["Open"]),
+                        "high": float(last["High"]),
+                        "low": float(last["Low"]),
+                        "volume": float(last["Volume"]),
+                        "previous_close": prev_close,
+                        "market_cap": None,
+                        "name": code,
+                        "currency": "JPY",
+                        "fifty_two_week_high": None,
+                        "fifty_two_week_low": None,
+                        "trading_value": None,
+                    }
+            except Exception:
+                pass
+
+            # 全方法失敗
+            _mark_failed(f"yf_realtime_{code}")
+        except Exception as e:
+            logger.warning(f"yfinance全体エラー ({code}): {e}")
+            _mark_failed(f"yf_realtime_{code}")
+
+    # フォールバック: 既存スクレイパー
     return _fetch_realtime_via_scraper(code)
 
 
 @cached(ttl=300)
 def fetch_historical_data(code: str, period: str = "1y") -> pd.DataFrame | None:
-    """履歴データを取得する（yfinance -> download -> スクレイパーフォールバック）"""
+    """履歴データを取得する"""
+
+    if _is_recently_failed(f"yf_hist_{code}_{period}"):
+        return _fallback_historical(code)
 
     # 方法1: yfinance Ticker.history
     try:
@@ -214,7 +240,6 @@ def fetch_historical_data(code: str, period: str = "1y") -> pd.DataFrame | None:
         import yfinance as yf
         df = yf.download(_to_ticker(code), period=period, progress=False)
         if df is not None and not df.empty:
-            # マルチカラムインデックスを修正
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             df.index.name = "Date"
@@ -222,8 +247,12 @@ def fetch_historical_data(code: str, period: str = "1y") -> pd.DataFrame | None:
     except Exception as e:
         logger.warning(f"yfinance download取得失敗 ({code}): {e}")
 
-    # 方法3: スクレイパーからリアルタイム値のみのDataFrameを生成
-    logger.info(f"スクレイパーフォールバックで単一行データを生成 ({code})")
+    _mark_failed(f"yf_hist_{code}_{period}")
+    return _fallback_historical(code)
+
+
+def _fallback_historical(code: str) -> pd.DataFrame | None:
+    """スクレイパーからの最小限の履歴データ"""
     rt = _fetch_realtime_via_scraper(code)
     if rt and rt.get("price"):
         today = pd.Timestamp.now().normalize()
@@ -235,18 +264,21 @@ def fetch_historical_data(code: str, period: str = "1y") -> pd.DataFrame | None:
             "Volume": [rt.get("volume") or 0],
         }, index=pd.DatetimeIndex([today], name="Date"))
         return df
-
     return None
 
 
 @cached(ttl=600)
 def fetch_fundamental_data(code: str) -> dict | None:
     """ファンダメンタルデータを取得する"""
+    if _is_recently_failed(f"yf_fund_{code}"):
+        return None
+
     try:
         import yfinance as yf
         ticker = yf.Ticker(_to_ticker(code))
         info = ticker.info
         if not info:
+            _mark_failed(f"yf_fund_{code}")
             return None
 
         return {
@@ -273,12 +305,16 @@ def fetch_fundamental_data(code: str) -> dict | None:
             "two_hundred_day_average": info.get("twoHundredDayAverage"),
         }
     except Exception as e:
-        logger.error(f"ファンダメンタルデータ取得エラー ({code}): {e}")
+        logger.warning(f"ファンダメンタルデータ取得エラー ({code}): {e}")
+        _mark_failed(f"yf_fund_{code}")
         return None
 
 
 def fetch_board_posts(code: str, pages: int = 1) -> list[dict]:
     """掲示板データを取得する（既存scraperを利用）"""
+    if _is_recently_failed(f"board_{code}"):
+        return []
+
     try:
         from scraper import BoardScraper
         scraper = BoardScraper()
@@ -291,21 +327,25 @@ def fetch_board_posts(code: str, pages: int = 1) -> list[dict]:
                 time.sleep(1.5)
         return all_posts
     except Exception as e:
-        logger.error(f"掲示板データ取得エラー ({code}): {e}")
+        logger.warning(f"掲示板データ取得エラー ({code}): {e}")
+        _mark_failed(f"board_{code}")
         return []
 
 
 @cached(ttl=300)
 def fetch_nikkei225_data(period: str = "1y") -> pd.DataFrame | None:
     """日経225データを取得（ベータ値計算用）"""
+    if _is_recently_failed("yf_nikkei"):
+        return None
+
     try:
         import yfinance as yf
         ticker = yf.Ticker("^N225")
         df = ticker.history(period=period)
         if df is not None and not df.empty:
             return df
-    except Exception as e:
-        logger.warning(f"日経225 history取得失敗: {e}")
+    except Exception:
+        pass
 
     try:
         import yfinance as yf
@@ -314,7 +354,8 @@ def fetch_nikkei225_data(period: str = "1y") -> pd.DataFrame | None:
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             return df
-    except Exception as e:
-        logger.error(f"日経225 download取得失敗: {e}")
+    except Exception:
+        pass
 
+    _mark_failed("yf_nikkei")
     return None
