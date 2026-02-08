@@ -4,7 +4,10 @@ import re
 from dataclasses import dataclass, field
 
 import requests
+import urllib3
 from bs4 import BeautifulSoup
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 try:
     import yfinance as yf
@@ -66,6 +69,7 @@ class StockScraper:
     def __init__(self, session: requests.Session | None = None):
         self.session = session or requests.Session()
         self.session.headers.update(HEADERS)
+        self.session.verify = False
 
     def fetch(self, code: str) -> StockPrice:
         """株価情報を取得する

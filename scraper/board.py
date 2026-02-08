@@ -5,7 +5,10 @@ from dataclasses import dataclass
 from urllib.parse import urljoin
 
 import requests
+import urllib3
 from bs4 import BeautifulSoup
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 BASE_URL = "https://finance.yahoo.co.jp"
 BOARD_URL = f"{BASE_URL}/cm/message"
@@ -51,6 +54,7 @@ class BoardScraper:
     def __init__(self, session: requests.Session | None = None):
         self.session = session or requests.Session()
         self.session.headers.update(HEADERS)
+        self.session.verify = False
 
     def _build_board_url(self, code: str) -> str:
         """掲示板のURLを構築する
