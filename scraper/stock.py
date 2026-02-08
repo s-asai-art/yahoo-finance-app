@@ -1,27 +1,13 @@
 """Yahoo!ファイナンスから株価情報を取得するモジュール"""
 
-import os
 import re
-import ssl
 from dataclasses import dataclass, field
 
 import requests
 import urllib3
 from bs4 import BeautifulSoup
 
-# SSL証明書検証をグローバルに無効化（yfinance内部のHTTPクライアント含む）
-os.environ["PYTHONHTTPSVERIFY"] = "0"
-os.environ["CURL_CA_BUNDLE"] = ""
-os.environ["REQUESTS_CA_BUNDLE"] = ""
-ssl._create_default_https_context = ssl._create_unverified_context
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-try:
-    import yfinance as yf
-
-    HAS_YFINANCE = True
-except ImportError:
-    HAS_YFINANCE = False
 
 BASE_URL = "https://finance.yahoo.co.jp"
 HEADERS = {
@@ -87,48 +73,7 @@ class StockScraper:
         Returns:
             StockPrice: 株価情報
         """
-        # yfinanceが利用可能ならAPIベースで取得し、失敗時はスクレイピングへ
-        if HAS_YFINANCE:
-            try:
-                return self._fetch_via_yfinance(code)
-            except Exception:
-                pass
         return self._fetch_via_scraping(code)
-
-    def _normalize_code(self, code: str) -> str:
-        """銘柄コードを正規化する（.Tサフィックスを確保）"""
-        code = code.strip()
-        if re.match(r"^\d{4}$", code):
-            return f"{code}.T"
-        return code
-
-    def _fetch_via_yfinance(self, code: str) -> StockPrice:
-        """yfinanceライブラリ経由で株価を取得"""
-        ticker_code = self._normalize_code(code)
-        ticker = yf.Ticker(ticker_code)
-        info = ticker.info
-
-        return StockPrice(
-            code=code,
-            name=info.get("longName") or info.get("shortName", ""),
-            market=info.get("exchange", ""),
-            price=str(info.get("currentPrice") or info.get("regularMarketPrice", "")),
-            change=str(info.get("regularMarketChange", "")),
-            change_percent=str(info.get("regularMarketChangePercent", "")),
-            previous_close=str(info.get("previousClose", "")),
-            open_price=str(info.get("open") or info.get("regularMarketOpen", "")),
-            high=str(info.get("dayHigh") or info.get("regularMarketDayHigh", "")),
-            low=str(info.get("dayLow") or info.get("regularMarketDayLow", "")),
-            volume=str(info.get("volume") or info.get("regularMarketVolume", "")),
-            market_cap=str(info.get("marketCap", "")),
-            extra={
-                "52週高値": str(info.get("fiftyTwoWeekHigh", "")),
-                "52週安値": str(info.get("fiftyTwoWeekLow", "")),
-                "PER": str(info.get("trailingPE", "")),
-                "PBR": str(info.get("priceToBook", "")),
-                "配当利回り": str(info.get("dividendYield", "")),
-            },
-        )
 
     def _fetch_via_scraping(self, code: str) -> StockPrice:
         """Webスクレイピングで株価を取得"""
