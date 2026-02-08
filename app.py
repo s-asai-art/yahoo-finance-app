@@ -226,9 +226,12 @@ if realtime is None and (hist_df is None or hist_df.empty):
     st.stop()
 
 # データ前処理
+has_full_history = False
 if hist_df is not None and not hist_df.empty:
     hist_df = clean_price_data(hist_df)
-    hist_df = get_all_technical_indicators(hist_df)
+    if len(hist_df) > 30:
+        has_full_history = True
+        hist_df = get_all_technical_indicators(hist_df)
 
 # --- ヘッダー: 株価表示 ---
 stock_name = realtime.get("name", code) if realtime else code
@@ -436,23 +439,23 @@ with summary_col:
     st.markdown("### 🎯 投資判断")
 
     # テクニカルシグナル取得
-    tech_signals = get_technical_signals(hist_df) if hist_df is not None and not hist_df.empty else []
+    tech_signals = get_technical_signals(hist_df) if has_full_history else []
     fund_evals = evaluate_fundamental(fundamental)
     sentiment_data = analyze_posts_sentiment(board_posts) if board_posts else None
 
     # ML予測
-    if hist_df is not None and not hist_df.empty and not st.session_state.models_trained:
+    if has_full_history and not st.session_state.models_trained:
         with st.spinner("AIモデル学習中..."):
             st.session_state.price_predictor.train(hist_df)
             st.session_state.trend_classifier.train(hist_df)
             st.session_state.volatility_model.train(hist_df)
             st.session_state.models_trained = True
 
-    trend_pred = st.session_state.trend_classifier.predict(hist_df) if hist_df is not None else None
+    trend_pred = st.session_state.trend_classifier.predict(hist_df) if has_full_history else None
 
     # リスク評価
     nikkei_df = fetch_nikkei225_data(st.session_state.chart_period)
-    risk_data = get_risk_assessment(hist_df, nikkei_df) if hist_df is not None and not hist_df.empty else None
+    risk_data = get_risk_assessment(hist_df, nikkei_df) if has_full_history else None
 
     # 総合スコア算出
     score_data = calculate_investment_score(
